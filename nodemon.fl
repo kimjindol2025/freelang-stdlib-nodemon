@@ -1,0 +1,392 @@
+/**
+ * FreeLang stdlib — nodemon
+ *
+ * npm nodemon 완전 대체 구현
+ * 파일 변경 감지 + 프로세스 자동 재시작 (개발용)
+ *
+ * 사용 예시:
+ *   import "stdlib/nodemon"
+ *
+ *   // 기본 사용
+ *   let state = start("index.fl")
+ *
+ *   // 설정 포함
+ *   let cfg = NodemonConfig {
+ *     script: "src/server.fl",
+ *     watch: ["src", "stdlib"],
+ *     ext: ["fl", "free"],
+ *     ignore: ["*.test.fl", "dist/"],
+ *     delay: 1000,
+ *     env: {},
+ *     execMap: {},
+ *     verbose: true,
+ *     restartable: "rs",
+ *     signal: "SIGTERM"
+ *   }
+ *   let state2 = startConfig(cfg)
+ *
+ *   // 이벤트 핸들러
+ *   onRestart(state2, fn(file: string) {
+ *     println("[app] " + file + " 변경으로 재시작")
+ *   })
+ *   onCrash(state2, fn(code: int) {
+ *     println("[app] 크래시 (exit: " + str(code) + ")")
+ *   })
+ *
+ *   // 수동 재시작 / 종료
+ *   restart(state2)
+ *   stop(state2)
+ *
+ * 콘솔 출력 형식:
+ *   [nodemon] 시작: index.fl
+ *   [nodemon] 감시: *.fl, *.free
+ *   [nodemon] 변경 감지: src/server.fl
+ *   [nodemon] 재시작 중...
+ *   [nodemon] 재시작 #3 (14:32:01)
+ *   [nodemon] 크래시 (exit 1) — 파일 변경 대기 중
+ *   [nodemon] "rs" 입력 시 수동 재시작
+ *   [nodemon] 종료
+ *
+ * 네이티브 함수 (src/stdlib-nodemon.ts):
+ *   nodemon_spawn(script, execCmd, env)    → pid
+ *   nodemon_kill(pid, signal)              → bool
+ *   nodemon_is_running(pid)                → bool
+ *   nodemon_watch_start(paths, exts, ignores, delay) → watchId
+ *   nodemon_watch_stop(watchId)            → void
+ *   nodemon_watch_pop_event(watchId)       → string | null
+ *   nodemon_watch_pending(watchId)         → bool
+ *   nodemon_timestamp()                    → int
+ *   nodemon_format_time(ts)                → string
+ *   nodemon_stdin_enable_rs()              → void
+ *   nodemon_stdin_check_rs()               → bool
+ */
+
+// ============================================
+// ANSI 색상
+// ============================================
+
+let NODEMON_GREEN  = "\033[32m"
+let NODEMON_YELLOW = "\033[33m"
+let NODEMON_RED    = "\033[31m"
+let NODEMON_CYAN   = "\033[36m"
+let NODEMON_BOLD   = "\033[1m"
+let NODEMON_RESET  = "\033[0m"
+
+// ============================================
+// Struct 정의
+// ============================================
+
+struct NodemonConfig {
+  script: string,        // 실행할 파일 (기본: "index.fl")
+  watch: any,            // 감시 경로 목록 (array, 기본: ["."])
+  ext: any,              // 감시 확장자 (array, 기본: ["fl","free","ts","js"])
+  ignore: any,           // 무시 패턴 (array, 기본: ["node_modules","*.test.fl"])
+  delay: int,            // 재시작 지연 ms (기본: 500)
+  env: any,              // 추가 환경변수 (map)
+  execMap: any,          // 확장자별 실행 명령 (map)
+  verbose: bool,
+  restartable: string,   // 재시작 키 (기본: "rs")
+  signal: string         // 종료 시그널 (기본: "SIGTERM")
+}
+
+struct NodemonState {
+  pid: int,              // 현재 실행 중인 프로세스 PID
+  watchId: int,          // 파일 감시 ID
+  script: string,
+  config: NodemonConfig,
+  isRunning: bool,
+  restartCount: int,
+  lastRestart: int,      // timestamp (ms)
+  watchedFiles: any      // array
+}
+
+struct NodemonEvent {
+  type: string,          // "start"|"restart"|"crash"|"quit"|"config:update"
+  timestamp: int,
+  file: string,          // 변경된 파일 (restart 시)
+  exitCode: int          // crash 시
+}
+
+// ============================================
+// 기본 설정 생성
+// ============================================
+
+fn defaultConfig(script: string) -> NodemonConfig {
+  return NodemonConfig {
+    script: script,
+    watch: ["."],
+    ext: ["fl", "free", "ts", "js"],
+    ignore: ["node_modules", "*.test.fl", "dist/", ".git/"],
+    delay: 500,
+    env: {},
+    execMap: {},
+    verbose: false,
+    restartable: "rs",
+    signal: "SIGTERM"
+  }
+}
+
+// ============================================
+// 로그 헬퍼
+// ============================================
+
+fn logInfo(msg: string) -> void {
+  println(NODEMON_GREEN + "[nodemon]" + NODEMON_RESET + " " + msg)
+}
+
+fn logWarn(msg: string) -> void {
+  println(NODEMON_YELLOW + "[nodemon]" + NODEMON_RESET + " " + msg)
+}
+
+fn logError(msg: string) -> void {
+  println(NODEMON_RED + "[nodemon]" + NODEMON_RESET + " " + msg)
+}
+
+// ============================================
+// 실행 명령 결정
+// ============================================
+
+fn resolveExecCmd(config: NodemonConfig) -> string {
+  // execMap에서 확장자별 실행 명령 찾기
+  let parts = str.split(config.script, ".")
+  if arr.length(parts) > 1 {
+    let ext = parts[arr.length(parts) - 1]
+    let cmd = nodemon_map_get(config.execMap, ext)
+    if cmd != null {
+      return cmd
+    }
+    // 기본 매핑
+    if ext == "fl" {
+      return "freelang"
+    }
+    if ext == "free" {
+      return "freelang"
+    }
+    if ext == "ts" {
+      return "ts-node"
+    }
+    if ext == "js" {
+      return "node"
+    }
+  }
+  return "freelang"
+}
+
+// ============================================
+// 프로세스 시작
+// ============================================
+
+fn spawnProcess(config: NodemonConfig) -> int {
+  let cmd = resolveExecCmd(config)
+  let pid = nodemon_spawn(config.script, cmd, config.env)
+  return pid
+}
+
+// ============================================
+// 핵심 함수: start
+// ============================================
+
+fn start(script: string) -> NodemonState {
+  let config = defaultConfig(script)
+  return startConfig(config)
+}
+
+fn startConfig(config: NodemonConfig) -> NodemonState {
+  // 1. 프로세스 시작
+  let pid = spawnProcess(config)
+
+  // 2. 파일 감시 시작
+  let watchId = nodemon_watch_start(config.watch, config.ext, config.ignore, config.delay)
+
+  // 3. 상태 초기화
+  let state = NodemonState {
+    pid: pid,
+    watchId: watchId,
+    script: config.script,
+    config: config,
+    isRunning: pid > 0,
+    restartCount: 0,
+    lastRestart: nodemon_timestamp(),
+    watchedFiles: config.watch
+  }
+
+  // 4. 콘솔 출력
+  logInfo(NODEMON_BOLD + "시작: " + NODEMON_RESET + config.script)
+  logInfo("감시: *." + arr.join(config.ext, ", *."))
+  if config.verbose {
+    logInfo("감시 경로: " + arr.join(config.watch, ", "))
+    logInfo("무시 패턴: " + arr.join(config.ignore, ", "))
+    logInfo("재시작 지연: " + str(config.delay) + "ms")
+  }
+  logInfo(NODEMON_CYAN + "\"" + config.restartable + "\" 입력 시 수동 재시작" + NODEMON_RESET)
+
+  // 5. stdin "rs" 입력 감지 활성화
+  nodemon_stdin_enable_rs()
+
+  return state
+}
+
+// ============================================
+// 프로세스 재시작
+// ============================================
+
+fn restart(state: NodemonState) -> NodemonState {
+  // 기존 프로세스 종료
+  if state.isRunning {
+    nodemon_kill(state.pid, state.config.signal)
+  }
+
+  // 새 프로세스 시작
+  let newPid = spawnProcess(state.config)
+
+  state.pid = newPid
+  state.isRunning = newPid > 0
+  state.restartCount = state.restartCount + 1
+  state.lastRestart = nodemon_timestamp()
+
+  let timeStr = nodemon_format_time(state.lastRestart)
+  logInfo("재시작 #" + str(state.restartCount) + " (" + timeStr + ")")
+
+  return state
+}
+
+// ============================================
+// 프로세스 종료
+// ============================================
+
+fn stop(state: NodemonState) -> void {
+  if state.isRunning {
+    nodemon_kill(state.pid, state.config.signal)
+    state.isRunning = false
+  }
+  nodemon_watch_stop(state.watchId)
+  logInfo("종료")
+}
+
+// ============================================
+// 이벤트 루프 (메인 감시 루프)
+// ============================================
+
+fn runLoop(state: NodemonState) -> void {
+  logInfo("이벤트 루프 시작")
+
+  let running = true
+  while running {
+    // stdin "rs" 확인
+    if nodemon_stdin_check_rs() {
+      logWarn("수동 재시작...")
+      state = restart(state)
+    }
+
+    // 파일 변경 이벤트 확인
+    if nodemon_watch_pending(state.watchId) {
+      let changedFile = nodemon_watch_pop_event(state.watchId)
+      if changedFile != null {
+        logWarn("변경 감지: " + changedFile)
+        logWarn("재시작 중...")
+        state = restart(state)
+      }
+    }
+
+    // 프로세스 크래시 감지
+    if state.isRunning {
+      if !nodemon_is_running(state.pid) {
+        state.isRunning = false
+        logError("크래시 (exit 1) — 파일 변경 대기 중")
+      }
+    }
+
+    // 10ms 슬립 (CPU 절약)
+    nodemon_sleep(10)
+  }
+}
+
+// ============================================
+// 이벤트 핸들러 등록
+// ============================================
+
+fn onEvent(state: NodemonState, handler: any) -> void {
+  nodemon_on_event(state.watchId, state.pid, handler)
+}
+
+fn onStart(state: NodemonState, handler: any) -> void {
+  nodemon_on_start(state.watchId, handler)
+}
+
+fn onRestart(state: NodemonState, handler: any) -> void {
+  nodemon_on_restart(state.watchId, handler)
+}
+
+fn onCrash(state: NodemonState, handler: any) -> void {
+  nodemon_on_crash(state.pid, handler)
+}
+
+fn onQuit(state: NodemonState, handler: any) -> void {
+  nodemon_on_quit(state.watchId, handler)
+}
+
+// ============================================
+// 감시 경로 동적 관리
+// ============================================
+
+fn addWatch(state: NodemonState, watchPath: string) -> void {
+  state.watchedFiles = arr.push(state.watchedFiles, watchPath)
+  nodemon_watch_add(state.watchId, watchPath)
+  if state.config.verbose {
+    logInfo("감시 추가: " + watchPath)
+  }
+}
+
+fn removeWatch(state: NodemonState, watchPath: string) -> void {
+  nodemon_watch_remove(state.watchId, watchPath)
+  if state.config.verbose {
+    logInfo("감시 제거: " + watchPath)
+  }
+}
+
+// ============================================
+// 상태 조회
+// ============================================
+
+fn getStatus(state: NodemonState) -> any {
+  return {
+    pid: state.pid,
+    script: state.script,
+    isRunning: state.isRunning,
+    restartCount: state.restartCount,
+    lastRestart: state.lastRestart,
+    watchedFiles: state.watchedFiles
+  }
+}
+
+// ============================================
+// Export
+// ============================================
+
+export {
+  NodemonConfig,
+  NodemonState,
+  NodemonEvent,
+
+  defaultConfig,
+
+  start,
+  startConfig,
+  stop,
+  restart,
+  runLoop,
+
+  onEvent,
+  onStart,
+  onRestart,
+  onCrash,
+  onQuit,
+
+  addWatch,
+  removeWatch,
+  getStatus,
+
+  logInfo,
+  logWarn,
+  logError
+}
